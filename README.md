@@ -11,3 +11,5 @@ echo new | tee protected/target # expected to fail
 echo new | ./supertee.py protected/target
 cat protected/target
 ```
+
+Note the payload "new\n" is the same size as curent file contents "old\n". If the payload were larger, supertee.py would hang.
