@@ -1,5 +1,7 @@
 # Copy Fail - CVE-2026-31431
 
+This fork adds `copy_fail_exp_deobfuscated.py`, a readable version of the original PoC with the same behavior.
+
 [Technical Writeup](https://xint.io/blog/copy-fail-linux-distributions)
 
 ## Tested Distro / Version

